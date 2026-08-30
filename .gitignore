@@ -1,0 +1,31 @@
+# --- secrets: never commit -------------------------------------------------
+.env
+.streamlit/secrets.toml
+
+# --- client data -----------------------------------------------------------
+# The sample spreadsheets hold Skylark's commercial data. They are supplied
+# with the assignment, not published with the code.
+*.xlsx
+*.xls
+*.csv
+data/
+
+# --- build artefacts -------------------------------------------------------
+*.zip
+*.duckdb
+
+# --- python ----------------------------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# --- editors / os ----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
