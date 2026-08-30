@@ -12,18 +12,10 @@ from datetime import datetime, timezone
 import pandas as pd
 import streamlit as st
 
-from src import credentials as creds_module
 from src import theme
 from src.agent import BIAgent, trim_history
 from src.config import Settings
-from src.credentials import Credentials
-from src.llm import (
-    PROVIDER_LABELS,
-    LLMError,
-    available_models,
-    build_llm_with_fallback,
-    detect_provider,
-)
+from src.llm import build_llm_with_fallback
 from src.logging_conf import get_logger, setup_logging
 from src.monday_client import MondayClient
 from src.tools import build_tools
@@ -55,29 +47,25 @@ AGENT_AVATAR = "🛩️"
 # --------------------------------------------------------------------------- #
 # Wiring
 # --------------------------------------------------------------------------- #
-@st.cache_resource(show_spinner=False, max_entries=4)
-def bootstrap(cache_key: tuple, _creds: Credentials, ttl: int, max_steps: int):
-    """Build the monday client, warehouse, tools and agent once per credential set.
-
-    ``_creds`` is underscore-prefixed so Streamlit does not hash it — the
-    identity of the entry is ``cache_key``, which carries only key *tails*.
-    """
-    creds = _creds
+@st.cache_resource(show_spinner=False)
+def bootstrap(fingerprint: str):
+    """Build the monday client, warehouse, tools and agent once per config."""
     settings = Settings.load()
+    settings.require_valid()
 
     client = MondayClient(
-        creds.monday_token,
+        settings.monday_api_token,
         url=settings.monday_api_url,
         api_version=settings.monday_api_version,
         timeout=settings.request_timeout,
     )
 
     work_orders_id = (
-        creds.work_orders_board_id
+        settings.work_orders_board_id
         or client.find_board_id("work order")
         or client.find_board_id("work_order")
     )
-    deals_id = creds.deals_board_id or client.find_board_id("deal")
+    deals_id = settings.deals_board_id or client.find_board_id("deal")
 
     specs: list[BoardSpec] = []
     if work_orders_id:
@@ -87,97 +75,58 @@ def bootstrap(cache_key: tuple, _creds: Credentials, ttl: int, max_steps: int):
     if not specs:
         raise WarehouseError(
             "Could not find a Work Orders or Deals board on this monday.com account. "
-            "Set the board ids explicitly, or check the token has access to them."
+            "Set MONDAY_WORK_ORDERS_BOARD_ID and MONDAY_DEALS_BOARD_ID explicitly."
         )
+    settings.resolved_boards = {s.table: s.board_id for s in specs}
 
-    warehouse = Warehouse(client, specs, ttl_seconds=ttl)
+    warehouse = Warehouse(client, specs, ttl_seconds=settings.cache_ttl_seconds)
     warehouse.ensure_loaded()
 
-    # A key typed in the sidebar is used on its own; deployment secrets can
-    # supply a chain with failover.
-    keys = {creds.provider: creds.api_key} if creds.source != "deployment" else settings.llm_keys()
-    llm = build_llm_with_fallback(creds.provider, keys, creds.model)
-
+    llm = build_llm_with_fallback(settings.llm_provider, settings.llm_keys(), settings.llm_model)
     tools = build_tools(warehouse)
-    agent = BIAgent(llm, warehouse, tools, max_steps=max_steps)
-    return client, warehouse, agent, llm
+    agent = BIAgent(llm, warehouse, tools, max_steps=settings.max_agent_steps)
+    return settings, client, warehouse, agent, llm
 
 
-@st.cache_data(show_spinner=False, ttl=900, max_entries=8)
-def cached_models(provider: str, key_tail: str, _api_key: str) -> list[str]:
-    """Model list for the picker, cached so keystrokes do not re-query the vendor.
+def config_fingerprint(settings: Settings) -> str:
+    """Cache key for `bootstrap`. Changing any credential must rebuild the app,
+    so every key contributes its tail — enough to differ, never enough to leak."""
+    return "|".join([
+        settings.monday_api_token[-6:],
+        settings.work_orders_board_id,
+        settings.deals_board_id,
+        settings.llm_provider,
+        settings.llm_model,
+        str(settings.cache_ttl_seconds),
+        *(key[-6:] for _provider, key in sorted(settings.llm_keys().items())),
+    ])
 
-    The key itself is underscore-prefixed and therefore never becomes part of a
-    cache key; ``key_tail`` distinguishes entries instead.
-    """
-    return available_models(provider, _api_key)
 
+def render_setup_help(problems: list[str]) -> None:
+    st.markdown(theme.hero_block(), unsafe_allow_html=True)
+    st.error("The agent is not configured yet.")
+    for problem in problems:
+        st.write(f"- {problem}")
+    st.markdown(
+        """
+### How to fix it
 
-# --------------------------------------------------------------------------- #
-# Credentials panel
-# --------------------------------------------------------------------------- #
-def render_credentials_panel(settings: Settings) -> Credentials:
-    """Two rows — LLM key (+ model), then monday token. Rendered in the sidebar.
+**Running locally** — copy `.env.example` to `.env` and fill it in.
 
-    The provider is inferred from the key's prefix, and the model list is fetched
-    from that provider, so a reviewer cannot pick an OpenAI model with a Gemini
-    key or vice versa.
-    """
-    st.session_state.setdefault("llm_api_key", "")
-    st.session_state.setdefault("monday_token", "")
-    st.session_state.setdefault("llm_model", "")
+**On Streamlit Community Cloud** — open *Manage app → Settings → Secrets* and paste:
 
-    with st.sidebar:
-        st.subheader("Connect")
+```toml
+MONDAY_API_TOKEN = "your_monday_token"
+GEMINI_API_KEY   = "your_google_ai_studio_key"
+LLM_PROVIDER     = "gemini"
+MONDAY_DEALS_BOARD_ID       = "1234567890"
+MONDAY_WORK_ORDERS_BOARD_ID = "0987654321"
+```
 
-        # ---------------------------------------------------------- row 1: LLM
-        api_key = st.text_input(
-            "LLM API key",
-            type="password",
-            key="llm_api_key",
-            placeholder="sk-… , sk-ant-… or AIza…",
-            help="OpenAI, Anthropic or Google Gemini. Used only for your session — never stored.",
-        )
-
-        provider = detect_provider(api_key)
-        if api_key and not provider:
-            st.caption("⚠️ Key not recognised — expected `sk-`, `sk-ant-` or `AIza`.")
-        elif provider:
-            st.caption(f"Detected **{PROVIDER_LABELS[provider]}**")
-
-        models: list[str] = []
-        if provider and api_key:
-            try:
-                models = cached_models(provider, api_key[-8:], api_key)
-            except LLMError as exc:
-                st.caption(f"⚠️ {exc}")
-
-        if models:
-            current = st.session_state.get("llm_model") or ""
-            index = models.index(current) if current in models else 0
-            st.selectbox(
-                f"{PROVIDER_LABELS[provider]} model",
-                models,
-                index=index,
-                key="llm_model",
-                help="Listed newest and fastest first. Flash / mini models answer quickest.",
-            )
-        elif api_key and provider:
-            st.caption("Checking available models…")
-
-        # ------------------------------------------------------ row 2: monday
-        st.text_input(
-            "monday.com API token",
-            type="password",
-            key="monday_token",
-            placeholder="eyJhbGciOi…",
-            help="monday.com → avatar → Developers → My access tokens. Read-only use.",
-        )
-
-        resolved = creds_module.resolve(st.session_state, settings)
-        if resolved.source == "deployment" and resolved.complete:
-            st.caption("Using the deployment's own keys. Enter your own above to override.")
-        return resolved
+Get a monday token from **Profile → Developers → My access tokens**.
+Get a free Gemini key from **https://aistudio.google.com/apikey**.
+        """
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -185,6 +134,8 @@ def render_credentials_panel(settings: Settings) -> Credentials:
 # --------------------------------------------------------------------------- #
 def render_sidebar(settings: Settings, warehouse: Warehouse, llm) -> None:
     with st.sidebar:
+        st.markdown(theme.brand_block(), unsafe_allow_html=True)
+
         try:
             result = warehouse.ensure_loaded()
         except WarehouseError as exc:
@@ -203,11 +154,12 @@ def render_sidebar(settings: Settings, warehouse: Warehouse, llm) -> None:
         st.markdown(theme.stat_cards(cards), unsafe_allow_html=True)
 
         loaded = result.loaded_at.replace(tzinfo=timezone.utc).astimezone()
-        age = int((datetime.now(timezone.utc) - result.loaded_at.replace(tzinfo=timezone.utc)).total_seconds())
+        age = int(
+            (datetime.now(timezone.utc) - result.loaded_at.replace(tzinfo=timezone.utc)).total_seconds()
+        )
         st.markdown(
             theme.meta_line(
-                f"Synced {loaded:%H:%M:%S} · {age}s ago<br>"
-                f"Cache {settings.cache_ttl_seconds}s"
+                f"Synced {loaded:%H:%M:%S} · {age}s ago<br>Cache {settings.cache_ttl_seconds}s"
             ),
             unsafe_allow_html=True,
         )
@@ -251,19 +203,17 @@ def render_sidebar(settings: Settings, warehouse: Warehouse, llm) -> None:
                 st.divider()
 
         # ------------------------------------------------------------ model
-        st.subheader("Active model")
+        st.subheader("Model")
         standby = (
             f"<br>Failover ready · {', '.join(llm.standby_providers)}"
             if llm.standby_providers else ""
         )
         st.markdown(
-            theme.meta_line(
-                f"{PROVIDER_LABELS.get(llm.provider, llm.provider)} · "
-                f"<code>{llm.model}</code>{standby}"
-            ),
+            theme.meta_line(f"{llm.provider} · <code>{llm.model}</code>{standby}"),
             unsafe_allow_html=True,
         )
 
+        st.subheader("Session")
         if st.button("Clear conversation", use_container_width=True):
             st.session_state.history = []
             st.session_state.transcript = []
@@ -317,61 +267,29 @@ def render_empty_state() -> None:
                 st.rerun()
 
 
-def render_welcome(creds: Credentials) -> None:
-    """Shown until both credentials are present."""
-    st.markdown(theme.hero_block(), unsafe_allow_html=True)
-    needed = " and ".join(creds.missing())
-    st.info(f"To get started, add {needed} in the sidebar.")
-    st.markdown(
-        """
-##### Where to get them
-
-**LLM API key** — any one of:
-
-| Provider | Where | Cost |
-|---|---|---|
-| Google Gemini | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | free tier, no card |
-| OpenAI | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) | pay as you go |
-| Anthropic | [console.anthropic.com](https://console.anthropic.com/settings/keys) | pay as you go |
-
-The provider is detected from the key, and the model list is loaded from that
-provider — so you can only pick a model the key can actually use.
-
-**monday.com token** — in monday.com, avatar → **Developers** → **My access tokens** →
-**Show**. The agent only ever reads.
-
-Keys stay in your browser session. They are never written to disk, never logged, and
-never shared with another visitor.
-        """
-    )
-
-
 def main() -> None:
     setup_logging()
     settings = Settings.load()
-
-    with st.sidebar:
-        st.markdown(theme.brand_block(), unsafe_allow_html=True)
-
-    creds = render_credentials_panel(settings)
-    if not creds.complete:
-        render_welcome(creds)
+    problems = settings.missing()
+    if problems:
+        render_setup_help(problems)
         return
 
     try:
-        client, warehouse, agent, llm = bootstrap(
-            creds.cache_key(), creds, settings.cache_ttl_seconds, settings.max_agent_steps
-        )
+        settings, client, warehouse, agent, llm = bootstrap(config_fingerprint(settings))
     except Exception as exc:  # noqa: BLE001 - the startup page must never itself crash
         st.markdown(theme.hero_block(), unsafe_allow_html=True)
-        st.error("Could not connect.")
+        st.error("Could not start up.")
         st.write(getattr(exc, "user_message", None) or str(exc))
         st.info(
-            "Most common causes: an expired monday.com token, a board the token cannot "
-            "see, or an LLM key with no quota left. Correct it in the sidebar and it will retry."
+            "Most common causes: an expired monday.com token, a board id the token cannot "
+            "see, or an LLM key with no quota left."
         )
         with st.expander("Technical detail"):
             st.exception(exc)
+        if st.button("Retry"):
+            st.cache_resource.clear()
+            st.rerun()
         return
 
     render_sidebar(settings, warehouse, llm)
