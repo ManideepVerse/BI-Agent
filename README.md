@@ -344,7 +344,7 @@ pip install pytest
 python -m pytest tests/ -q
 ```
 
-146 tests run with **no credentials** — a fake monday client (`tests/fake_monday.py`) serves
+211 tests run with **no credentials** — a fake monday client (`tests/fake_monday.py`) serves
 deliberately messy fixtures: nine date spellings, rupee/dollar/lakh/crore amounts, `"TBD"` in
 numeric columns, four spellings of every sector, and nulls throughout.
 
@@ -439,8 +439,9 @@ Known and deliberate — the Decision Log has the reasoning:
 - **Multi-value columns.** `Type of Work` holds comma-separated lists, so filtering it with `=`
   undercounts. The cleaner flags these as possible duplicate labels rather than telling the
   agent to match with `LIKE`.
-- **No FX conversion.** If a value column mixes currencies the agent reports them separately
-  and refuses to add them rather than inventing a rate.
+- **No FX conversion.** A money column carries its currency per row (`amount_currency`), so
+  mixed-currency figures are grouped and reported separately rather than summed. No rate is
+  ever invented.
 - **Single-process cache.** Data is cached per Streamlit server process. Multi-replica
   deployments would want Redis.
 - **No auth on the hosted app.** Anyone with the link can query the data. Add Streamlit's

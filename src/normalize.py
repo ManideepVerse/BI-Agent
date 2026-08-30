@@ -254,44 +254,49 @@ def _numeric_to_date(number: float) -> Optional[date]:
 # --------------------------------------------------------------------------- #
 # Label canonicalisation
 # --------------------------------------------------------------------------- #
+# Aliases are for labels that are the SAME thing written differently, never for
+# labels that mean different things. "Dropped" -> "Closed Lost", "Planned" ->
+# "Not Started" and "Active" -> "In Progress" used to live here: those are
+# opinions about someone else's funnel, not spelling fixes, and they changed the
+# numbers. Every merge these tables do is now reported in the quality report.
 STATUS_ALIASES = {
-    "won": "Closed Won", "closedwon": "Closed Won", "dealwon": "Closed Won",
-    "closewon": "Closed Won", "winr": "Closed Won", "success": "Closed Won",
-    "lost": "Closed Lost", "closedlost": "Closed Lost", "deallost": "Closed Lost",
-    "closelost": "Closed Lost", "dropped": "Closed Lost",
-    "inprogress": "In Progress", "wip": "In Progress", "ongoing": "In Progress",
-    "inprocess": "In Progress", "active": "In Progress", "started": "In Progress",
-    "completed": "Completed", "complete": "Completed", "done": "Completed",
-    "finished": "Completed", "delivered": "Completed",
-    "onhold": "On Hold", "hold": "On Hold", "paused": "On Hold", "stalled": "On Hold",
-    "notstarted": "Not Started", "yettostart": "Not Started", "new": "Not Started",
-    "backlog": "Not Started", "planned": "Not Started",
-    "cancelled": "Cancelled", "canceled": "Cancelled", "terminated": "Cancelled",
-    "negotiation": "Negotiation", "innegotiation": "Negotiation",
-    "proposal": "Proposal", "proposalsent": "Proposal", "quotesent": "Proposal",
-    "qualified": "Qualified", "qualification": "Qualified",
-    "discovery": "Discovery", "prospecting": "Prospecting", "lead": "Lead",
+    "closedwon": "Closed Won", "closewon": "Closed Won", "dealwon": "Closed Won",
+    "wonclosed": "Closed Won",
+    "closedlost": "Closed Lost", "closelost": "Closed Lost", "deallost": "Closed Lost",
+    "lostclosed": "Closed Lost",
+    "inprogress": "In Progress", "inprocess": "In Progress", "wip": "In Progress",
+    "workinprogress": "In Progress",
+    "completed": "Completed", "complete": "Completed",
+    "onhold": "On Hold", "holdon": "On Hold",
+    "notstarted": "Not Started", "yettostart": "Not Started", "yettobestarted": "Not Started",
+    "cancelled": "Cancelled", "canceled": "Cancelled",
+    "innegotiation": "Negotiation", "negotiations": "Negotiation",
+    "proposalsent": "Proposal", "proposalssent": "Proposal",
+    "qualification": "Qualified",
 }
 
 SECTOR_ALIASES = {
-    "oilandgas": "Oil & Gas", "oilgas": "Oil & Gas", "og": "Oil & Gas", "oandg": "Oil & Gas",
-    "powerenergy": "Energy", "energysector": "Energy", "energyutilities": "Energy",
-    "renewableenergy": "Renewables", "renewable": "Renewables", "renewables": "Renewables",
-    "realestate": "Real Estate", "infra": "Infrastructure",
-    "telecom": "Telecom", "telecommunications": "Telecom",
-    "agri": "Agriculture", "agriculture": "Agriculture", "agritech": "Agriculture",
+    # Punctuation and abbreviation only. "Energy & Utilities" is deliberately
+    # NOT folded into "Energy" — they are different labels, and collapsing them
+    # is exactly the double-counting the report is meant to surface.
+    "oilandgas": "Oil & Gas", "oilgas": "Oil & Gas", "oandg": "Oil & Gas",
+    "realestate": "Real Estate",
+    "telecommunications": "Telecom",
+    "agriculture": "Agriculture",
 }
 
 
 def canonicalise_series(
     series: pd.Series, aliases: dict[str, str] | None = None
-) -> tuple[pd.Series, dict[str, str], list[list[str]]]:
+) -> tuple[pd.Series, dict[str, str], list[list[str]], dict[str, str]]:
     """Merge labels that differ only in case/whitespace/punctuation.
 
-    Returns ``(clean_series, mapping, near_duplicate_groups)``. Labels that are
-    merely *similar* (e.g. ``"Energy"`` vs ``"Energy & Utilities"``) are never
-    merged — they are returned as ``near_duplicate_groups`` so the agent can
-    warn the user instead.
+    Returns ``(clean_series, mapping, near_duplicate_groups, alias_merges)``.
+    Labels that are merely *similar* (``"Energy"`` vs ``"Energy & Utilities"``)
+    are never merged — they come back as ``near_duplicate_groups`` so the agent
+    can warn about possible double-counting. Anything the alias table *did*
+    merge comes back as ``alias_merges`` and is reported too: a silent merge is
+    indistinguishable from a bug in the answer.
     """
     aliases = aliases or {}
     by_key: dict[str, Counter] = defaultdict(Counter)
@@ -302,12 +307,22 @@ def canonicalise_series(
         if key:
             by_key[key][str(raw).strip()] += 1
 
+    # Two stages, deliberately separated. First the safe merge: labels that
+    # differ only in case, spacing or punctuation. Near-duplicate detection runs
+    # on *these* labels, before the alias table collapses any of them —
+    # otherwise an alias merging "Energy & Utilities" into "Energy" hides the
+    # very double-counting the report exists to surface.
+    by_spelling: dict[str, str] = {key: _pick_spelling(counter) for key, counter in by_key.items()}
+    near_dupes = _find_near_duplicates(sorted(set(by_spelling.values())))
+
+    # Then the alias table, whose every effect is recorded.
     canonical_for_key: dict[str, str] = {}
-    for key, counter in by_key.items():
-        if key in aliases:
-            canonical_for_key[key] = aliases[key]
-            continue
-        canonical_for_key[key] = _pick_spelling(counter)
+    alias_merges: dict[str, str] = {}
+    for key, spelling in by_spelling.items():
+        canonical = aliases.get(key, spelling)
+        canonical_for_key[key] = canonical
+        if canonical != spelling:
+            alias_merges[spelling] = canonical
 
     mapping: dict[str, str] = {}
     for key, counter in by_key.items():
@@ -315,9 +330,7 @@ def canonicalise_series(
             mapping[original] = canonical_for_key[key]
 
     clean = series.map(lambda v: None if is_null_token(v) else mapping.get(str(v).strip(), str(v).strip()))
-
-    near_dupes = _find_near_duplicates(sorted({v for v in canonical_for_key.values()}))
-    return clean, mapping, near_dupes
+    return clean, mapping, near_dupes, alias_merges
 
 
 def _pick_spelling(counter: Counter) -> str:
@@ -688,26 +701,39 @@ def normalize_board(
             out[name] = pd.to_datetime(parsed, errors="coerce")
             quality.assumptions.extend(notes)
         elif kind == "number":
-            numbers, currencies = _build_number_column(series, override, col_quality)
+            numbers, currencies, row_currency = _build_number_column(series, override, col_quality)
             out[name] = numbers
             if currencies:
                 quality.currencies_seen[name] = sorted(currencies)
+                # Keep the per-row currency so a mixed column can be grouped
+                # rather than merely warned about.
+                out[f"{name}__currency"] = row_currency.astype("string")
+                kinds[f"{name}__currency"] = "category"
                 if len(currencies) > 1:
                     quality.warnings.append(
-                        f"'{name}' mixes currencies {sorted(currencies)}; totals across "
-                        "them are not meaningful without an FX conversion."
+                        f"'{name}' mixes currencies {sorted(currencies)}. Group by "
+                        f"'{name}__currency' (exposed on the view as amount_currency) "
+                        "and report each separately — a combined total is meaningless "
+                        "without an FX rate."
                     )
         elif kind == "category":
             aliases = STATUS_ALIASES if re.search(r"stage|status|state", name) else (
                 SECTOR_ALIASES if re.search(r"sector|industry|vertical", name) else {}
             )
-            clean, mapping, near = canonicalise_series(series, aliases)
+            clean, mapping, near, alias_merges = canonicalise_series(series, aliases)
             out[name] = clean.astype("string")
             merged = {k: v for k, v in mapping.items() if k != v}
             if merged:
                 col_quality.notes.append(
                     f"{len(merged)} spelling variants merged (e.g. "
                     + "; ".join(f"'{k}'->'{v}'" for k, v in list(merged.items())[:3]) + ")"
+                )
+            if alias_merges:
+                detail = "; ".join(f"'{k}' counted as '{v}'" for k, v in alias_merges.items())
+                col_quality.notes.append(f"Distinct labels merged by the alias table: {detail}")
+                quality.warnings.append(
+                    f"'{name}': {detail}. These were different labels on the board — "
+                    "say so if the distinction matters to the answer."
                 )
             if near:
                 quality.near_duplicate_labels[name] = near
@@ -783,6 +809,37 @@ def _drop_header_echo_rows(raw: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     return raw[~mask], count
 
 
+def infer_dayfirst(values: Iterable[Any], default: bool = True) -> tuple[bool, int, str]:
+    """Work out DD/MM vs MM/DD for one column from the column's own values.
+
+    Returns ``(dayfirst, ambiguous_count, evidence)``. Any value whose first
+    component exceeds 12 proves day-first; any whose second exceeds 12 proves
+    month-first. Shared by the cleaner and the importer so a column is never
+    read one way on import and the other way afterwards.
+    """
+    ambiguous = day_first = month_first = 0
+    for value in values:
+        if is_null_token(value):
+            continue
+        parts = re.split(r"[/\-.]", str(value).strip())
+        if len(parts) == 3 and all(p.isdigit() for p in parts) and len(parts[0]) != 4:
+            a, b = int(parts[0]), int(parts[1])
+            if a > 12:
+                day_first += 1
+            elif b > 12:
+                month_first += 1
+            else:
+                ambiguous += 1
+
+    if day_first and not month_first:
+        return True, ambiguous, "values with day > 12"
+    if month_first and not day_first:
+        return False, ambiguous, "values with month > 12"
+    if day_first and month_first:
+        return default, ambiguous, "conflicting evidence"
+    return default, ambiguous, "no evidence"
+
+
 def _build_date_column(
     series: pd.Series,
     override: pd.Series,
@@ -790,30 +847,17 @@ def _build_date_column(
     col_quality: ColumnQuality,
 ) -> tuple[list[Optional[date]], list[str]]:
     notes: list[str] = []
-    values = [v for v in series if not is_null_token(v)]
+    effective_dayfirst, ambiguous, evidence = infer_dayfirst(series, default=dayfirst)
 
-    # Decide day-first vs month-first from the data itself, not a global guess.
-    ambiguous = 0
-    day_first_evidence = 0
-    month_first_evidence = 0
-    for value in values:
-        parts = re.split(r"[/\-.]", str(value).strip())
-        if len(parts) == 3 and all(p.isdigit() for p in parts) and len(parts[0]) != 4:
-            a, b = int(parts[0]), int(parts[1])
-            if a > 12:
-                day_first_evidence += 1
-            elif b > 12:
-                month_first_evidence += 1
-            else:
-                ambiguous += 1
-
-    effective_dayfirst = dayfirst
-    if day_first_evidence and not month_first_evidence:
-        effective_dayfirst = True
+    if evidence == "values with day > 12":
         notes.append(f"'{col_quality.name}': detected DD/MM/YYYY from values with day > 12.")
-    elif month_first_evidence and not day_first_evidence:
-        effective_dayfirst = False
+    elif evidence == "values with month > 12":
         notes.append(f"'{col_quality.name}': detected MM/DD/YYYY from values with month > 12.")
+    elif evidence == "conflicting evidence":
+        notes.append(
+            f"'{col_quality.name}': contains BOTH DD/MM and MM/DD dates — the column is "
+            f"internally inconsistent. Assumed {'DD/MM' if effective_dayfirst else 'MM/DD'}."
+        )
     elif ambiguous:
         notes.append(
             f"'{col_quality.name}': {ambiguous} slash/dash dates are ambiguous "
@@ -840,8 +884,15 @@ def _build_number_column(
     series: pd.Series,
     override: pd.Series,
     col_quality: ColumnQuality,
-) -> tuple[pd.Series, set[str]]:
+) -> tuple[pd.Series, set[str], pd.Series]:
+    """Parse a numeric column, keeping each row's currency.
+
+    Returns ``(numbers, currencies_seen, per_row_currency)``. The per-row series
+    is what lets the warehouse expose an ``amount_currency`` column: without it
+    a mixed-currency total can only be warned about, never actually avoided.
+    """
     numbers: list[Optional[float]] = []
+    row_currency: list[Optional[str]] = []
     currencies: set[str] = set()
     unparsed: list[str] = []
 
@@ -853,12 +904,24 @@ def _build_number_column(
         if number is None and not is_null_token(source):
             unparsed.append(str(source)[:40])
         numbers.append(number)
+        row_currency.append(currency)
 
     col_quality.unparsed = len(unparsed)
     col_quality.unparsed_examples = list(dict.fromkeys(unparsed))[:5]
     if unparsed:
         col_quality.notes.append(f"{len(unparsed)} values could not be read as numbers and are NULL.")
-    return pd.Series(numbers, index=series.index, dtype="float64"), currencies
+
+    # A single currency for the whole column is the normal case; label every row
+    # with it so grouping works even when only some cells carried a symbol.
+    if len(currencies) == 1:
+        only = next(iter(currencies))
+        row_currency = [only if n is not None else None for n in numbers]
+
+    return (
+        pd.Series(numbers, index=series.index, dtype="float64"),
+        currencies,
+        pd.Series(row_currency, index=series.index, dtype="object"),
+    )
 
 
 def _add_cross_column_warnings(df: pd.DataFrame, roles: dict[str, str], quality: TableQuality) -> None:

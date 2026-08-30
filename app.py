@@ -79,7 +79,12 @@ def bootstrap(fingerprint: str):
         )
     settings.resolved_boards = {s.table: s.board_id for s in specs}
 
-    warehouse = Warehouse(client, specs, ttl_seconds=settings.cache_ttl_seconds)
+    warehouse = Warehouse(
+        client,
+        specs,
+        ttl_seconds=settings.cache_ttl_seconds,
+        max_rows=settings.max_sql_rows,
+    )
     warehouse.ensure_loaded()
 
     llm = build_llm_with_fallback(settings.llm_provider, settings.llm_keys(), settings.llm_model)
@@ -268,8 +273,8 @@ def render_empty_state() -> None:
 
 
 def main() -> None:
-    setup_logging()
     settings = Settings.load()
+    setup_logging(settings.log_level)
     problems = settings.missing()
     if problems:
         render_setup_help(problems)

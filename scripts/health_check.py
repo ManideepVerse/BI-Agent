@@ -121,6 +121,7 @@ def check_boards(client: MondayClient, settings: Settings) -> list[BoardSpec]:
     info(f"{len(boards)} active board(s) visible to this token:")
     for board in boards:
         info(f"    · {board['name']} (id {board['id']}, {board.get('items_count', '?')} items)")
+    check_boards.items_by_id = {str(b["id"]): b.get("items_count") for b in boards}
 
     deals_id = settings.deals_board_id or client.find_board_id("deal")
     work_orders_id = settings.work_orders_board_id or client.find_board_id("work order")
@@ -148,7 +149,7 @@ def check_warehouse(client: MondayClient, specs: list[BoardSpec], settings: Sett
         bad("Skipped — no boards to load.")
         return None
 
-    warehouse = Warehouse(client, specs, ttl_seconds=settings.cache_ttl_seconds)
+    warehouse = Warehouse(client, specs, ttl_seconds=settings.cache_ttl_seconds, max_rows=settings.max_sql_rows)
     started = time.monotonic()
     try:
         result = warehouse.ensure_loaded()
@@ -171,6 +172,19 @@ def check_warehouse(client: MondayClient, specs: list[BoardSpec], settings: Sett
 
         if quality.row_count == 0:
             bad(f"    {name} has zero rows — did the import finish?")
+
+        # monday knows how many items the board holds. Comparing it to what
+        # actually loaded catches a truncated import, which otherwise shows up
+        # only as quietly understated totals in every answer.
+        expected = getattr(check_boards, "items_by_id", {}).get(quality.board_id)
+        if isinstance(expected, int) and expected != quality.row_count:
+            gap = expected - quality.row_count
+            note = (f"    {name}: monday reports {expected} items but {quality.row_count} loaded "
+                    f"({gap:+d}).")
+            if abs(gap) <= 2:
+                info(note + " Small difference — usually a blank item on the board.")
+            else:
+                warn(note + " Every total will be off by this much.")
 
     for name, message in result.errors.items():
         bad(f"    {name} failed to load: {message}")
@@ -202,11 +216,31 @@ def check_tools(warehouse: Warehouse) -> None:
             labels = [v["value"] for v in values["values"][:6]]
             ok(f"list_distinct_values({view}, sector): {labels}")
 
-    blocked = dispatch(tools, "run_sql", {"sql": "DROP TABLE deals_raw"})
-    if "error" in blocked:
-        ok("Read-only guard rejects DDL as expected")
+    # Testing only DROP used to report the guard as healthy while
+    # read_text('/…/secrets.toml') sailed straight through it.
+    attacks = {
+        "DDL (DROP)": "DROP TABLE deals_raw",
+        "DML (DELETE)": "DELETE FROM deals_raw",
+        "statement stacking": "SELECT 1; DROP TABLE deals_raw",
+        "file read": "SELECT * FROM read_text('/etc/hostname')",
+        "directory listing": "SELECT * FROM glob('/etc/*')",
+        "CSV read": "SELECT * FROM read_csv_auto('/etc/passwd')",
+        "extension install": "INSTALL httpfs",
+    }
+    leaked = [name for name, sql in attacks.items()
+              if "error" not in dispatch(tools, "run_sql", {"sql": sql})]
+    if leaked:
+        bad(f"SECURITY: these were NOT blocked: {', '.join(leaked)}")
     else:
-        bad("SECURITY: a DROP statement was NOT blocked")
+        ok(f"Read-only guard rejected all {len(attacks)} probes "
+           "(DDL, DML, stacking, filesystem, network)")
+
+    # And confirm queries that merely *look* dangerous still run.
+    legitimate = "SELECT COUNT(*) AS n FROM deals WHERE stage = 'Update Pending' -- check"
+    if "error" in dispatch(tools, "run_sql", {"sql": legitimate}):
+        bad("The guard is rejecting valid SQL (a literal containing a keyword).")
+    else:
+        ok("Valid SQL containing keyword-like literals and comments still runs")
 
     brief = dispatch(tools, "prepare_leadership_brief", {"period": "all_time"})
     if "error" in brief:

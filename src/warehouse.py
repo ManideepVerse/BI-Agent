@@ -57,9 +57,64 @@ PRIMARY_DATE_PREFERENCE = {
 
 _FORBIDDEN_SQL = re.compile(
     r"\b(insert|update|delete|drop|alter|create|attach|detach|copy|export|import|"
-    r"install|load|pragma|set|call|grant|revoke|truncate|replace|vacuum)\b",
+    r"install|load|pragma|call|grant|revoke|truncate|vacuum)\b",
     re.IGNORECASE,
 )
+
+# DuckDB reaches the filesystem and the network through ordinary table
+# functions, which no SQL keyword blocklist can catch. The connection itself is
+# locked down in `Warehouse.__init__`; this list only exists to return a clear
+# message instead of a raw PermissionException.
+_FILE_FUNCTIONS = re.compile(
+    r"\b(read_text|read_blob|read_csv|read_csv_auto|read_json|read_json_auto|"
+    r"read_parquet|read_ndjson|parquet_scan|csv_scan|glob|sniff_csv|"
+    r"delta_scan|iceberg_scan|postgres_scan|sqlite_scan|mysql_scan)\s*\(",
+    re.IGNORECASE,
+)
+
+
+def strip_sql_noise(sql: str) -> str:
+    """Blank out string literals, quoted identifiers and comments.
+
+    Keyword checks must never look inside a literal: a deal at stage
+    ``'Update Pending'`` is not an UPDATE, and ``LIKE '%;%'`` is not statement
+    stacking. Both were rejected before this existed.
+    """
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == "'":                                   # string literal
+            i += 1
+            while i < n:
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":  # escaped quote
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            out.append(" '' ")
+        elif ch == '"':                                 # quoted identifier
+            i += 1
+            while i < n and sql[i] != '"':
+                i += 1
+            i += 1
+            out.append(" id ")
+        elif ch == "-" and sql[i + 1:i + 2] == "-":      # line comment
+            while i < n and sql[i] != "\n":
+                i += 1
+            out.append(" ")
+        elif ch == "/" and sql[i + 1:i + 2] == "*":      # block comment
+            i += 2
+            while i + 1 < n and not (sql[i] == "*" and sql[i + 1] == "/"):
+                i += 1
+            i += 2
+            out.append(" ")
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 
 class WarehouseError(RuntimeError):
@@ -87,14 +142,47 @@ class LoadResult:
 class Warehouse:
     """Fetch → normalise → load → query. Thread-safe, TTL-cached."""
 
-    def __init__(self, client: MondayClient, specs: list[BoardSpec], *, ttl_seconds: int = 300):
+    def __init__(
+        self,
+        client: MondayClient,
+        specs: list[BoardSpec],
+        *,
+        ttl_seconds: int = 300,
+        max_rows: int = 200,
+    ):
         self._client = client
         self._specs = specs
         self._ttl = ttl_seconds
+        self._max_rows = max_rows
         self._lock = threading.Lock()
         self._con = duckdb.connect(":memory:")
+        self._harden(self._con)
         self._result: Optional[LoadResult] = None
         self._loaded_monotonic: float = 0.0
+        # role -> the name a real column was moved to when it collided
+        self._shadowed: dict[str, dict[str, str]] = {}
+
+    @staticmethod
+    def _harden(con: duckdb.DuckDBPyConnection) -> None:
+        """Take the filesystem and the network away from DuckDB itself.
+
+        The SQL this executes is written by an LLM from free-text input, and the
+        process holds monday and provider credentials. A keyword blocklist
+        cannot stop ``read_text('/…/secrets.toml')`` because it is a table
+        function, not a keyword — so external access is disabled at the engine,
+        and the configuration is then locked so no later statement can re-enable
+        it. Data arrives through registered DataFrames, never through files, so
+        nothing legitimate needs this.
+        """
+        for statement in (
+            "SET enable_external_access=false",
+            "SET allow_community_extensions=false",
+            "SET lock_configuration=true",
+        ):
+            try:
+                con.execute(statement)
+            except duckdb.Error as exc:  # pragma: no cover - version differences
+                log.warning("Could not apply '%s': %s", statement, exc)
 
     # -- loading -----------------------------------------------------------
     @property
@@ -148,7 +236,25 @@ class Warehouse:
 
     def _semantic_view_sql(self, table: NormalizedTable, raw_name: str) -> str:
         existing = set(table.df.columns)
-        projections: list[str] = ['"' + raw_name + '".*']
+
+        # A board can already own a column that snake-cases to a role name — a
+        # literal "Status" column alongside "Execution Status", say. Without
+        # this, DuckDB silently renames our alias to status_1 and `status`
+        # keeps pointing at the wrong column while get_schema claims otherwise.
+        # The role name is the contract, so the real column steps aside.
+        shadowed: dict[str, str] = {}
+        for role in SEMANTIC_ROLES:
+            source = table.roles.get(role)
+            if source and source != role and role in existing:
+                shadowed[role] = f"{role}_column"
+        self._shadowed[table.name] = shadowed
+
+        star = f'"{raw_name}".*'
+        if shadowed:
+            star += " EXCLUDE (" + ", ".join(f'"{name}"' for name in sorted(shadowed)) + ")"
+        projections: list[str] = [star]
+        for original, moved_to in sorted(shadowed.items()):
+            projections.append(f'"{original}" AS {moved_to}')
 
         for role in SEMANTIC_ROLES:
             source = table.roles.get(role)
@@ -162,6 +268,14 @@ class Warehouse:
                 )
                 if role not in existing:
                     projections.append(f"CAST(NULL AS {null_type}) AS {role}")
+
+        # Money columns carry their own currency when more than one was seen,
+        # so totals can be grouped rather than silently added together.
+        amount_source = table.roles.get("amount")
+        if amount_source and f"{amount_source}__currency" in existing:
+            projections.append(f'"{amount_source}__currency" AS amount_currency')
+        elif "amount_currency" not in existing:
+            projections.append("CAST(NULL AS VARCHAR) AS amount_currency")
 
         primary = None
         for candidate in PRIMARY_DATE_PREFERENCE.get(table.name, ["close_date", "end_date", "created_date"]):
@@ -182,30 +296,55 @@ class Warehouse:
             f"(CASE WHEN EXTRACT(month FROM {primary_expr}) >= 4 "
             f"THEN EXTRACT(year FROM {primary_expr}) + 1 "
             f"ELSE EXTRACT(year FROM {primary_expr}) END) AS fiscal_year",
+            # `//` is integer division. Plain `/` is float division in DuckDB,
+            # which produced quarters like 3.67 — every `fiscal_quarter = 1`
+            # filter then matched only April and under-reported by ~75%.
             f"(CASE WHEN {primary_expr} IS NULL THEN NULL "
-            f"ELSE ((EXTRACT(month FROM {primary_expr})::INTEGER + 8) % 12) / 3 + 1 END) AS fiscal_quarter",
+            f"ELSE (((EXTRACT(month FROM {primary_expr})::INTEGER + 8) % 12) // 3) + 1 "
+            f"END) AS fiscal_quarter",
         ])
 
         return f'CREATE OR REPLACE VIEW "{table.name}" AS SELECT {", ".join(projections)} FROM "{raw_name}"'
 
     # -- querying ----------------------------------------------------------
-    def run_sql(self, sql: str, *, max_rows: int = 200) -> pd.DataFrame:
-        """Run a read-only SELECT. Raises ``WarehouseError`` on anything else."""
+    def run_sql(self, sql: str, *, max_rows: int | None = None) -> pd.DataFrame:
+        """Run a read-only SELECT. Raises ``WarehouseError`` on anything else.
+
+        Checks run against a copy with string literals and comments blanked out,
+        so a value like ``'Update Pending'`` is not mistaken for an UPDATE.
+        """
         self.ensure_loaded()
-        statement = sql.strip().rstrip(";").strip()
-        if not statement:
+        limit = int(max_rows if max_rows is not None else self._max_rows)
+
+        statement = sql.strip()
+        bare = strip_sql_noise(statement).strip()
+
+        # A trailing ';' is fine; one *between* statements is not.
+        if bare.rstrip().rstrip(";").count(";"):
+            raise WarehouseError("Only a single statement is allowed; remove the extra ';'.")
+        statement = statement.rstrip().rstrip(";").rstrip()
+        bare = bare.rstrip().rstrip(";").rstrip()
+
+        if not bare:
             raise WarehouseError("Empty SQL statement.")
-        if ";" in statement:
-            raise WarehouseError("Only a single statement is allowed; remove the ';'.")
-        head = statement.lstrip("( \n\t").lower()
+
+        head = bare.lstrip("( \n\t").lower()
         if not (head.startswith("select") or head.startswith("with")):
             raise WarehouseError("Only SELECT / WITH queries are permitted (this agent is read-only).")
-        if _FORBIDDEN_SQL.search(statement):
+        if _FORBIDDEN_SQL.search(bare):
             raise WarehouseError("That statement contains a write or DDL keyword and was blocked.")
+        if _FILE_FUNCTIONS.search(bare):
+            raise WarehouseError(
+                "Filesystem and network functions are disabled. Query the loaded "
+                "tables only."
+            )
 
+        # The statement goes on its own line so a trailing -- comment cannot
+        # swallow the LIMIT that follows.
+        wrapped = f"SELECT * FROM (\n{statement}\n) LIMIT {limit}"
         with self._lock:
             try:
-                frame = self._con.execute(f"SELECT * FROM ({statement}) LIMIT {int(max_rows)}").df()
+                frame = self._con.execute(wrapped).df()
             except duckdb.Error as exc:
                 raise WarehouseError(str(exc)) from exc
         return frame
@@ -260,7 +399,7 @@ class Warehouse:
                     "missing_pct": round(col.null_pct, 1),
                     "distinct": col.distinct,
                 })
-            payload["tables"].append({
+            entry = {
                 "view": name,
                 "raw_table": f"{name}_raw",
                 "source_board": table.quality.board_name,
@@ -268,7 +407,19 @@ class Warehouse:
                 "semantic_mapping": table.roles,
                 "columns": columns,
                 "top_warnings": table.quality.warnings[:5],
-            })
+            }
+            shadowed = self._shadowed.get(name) or {}
+            if shadowed:
+                entry["renamed_to_avoid_collision"] = {
+                    f"{role} (the board's own column)": moved_to
+                    for role, moved_to in shadowed.items()
+                }
+                entry["collision_note"] = (
+                    "This board has its own column(s) named the same as a semantic alias. "
+                    "The alias wins; the board's original column is available under the "
+                    "renamed name shown above."
+                )
+            payload["tables"].append(entry)
 
         if result.errors:
             payload["boards_that_failed_to_load"] = result.errors

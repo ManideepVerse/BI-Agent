@@ -8,7 +8,6 @@ self-correction opportunity for the model instead of a crashed conversation.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Callable
@@ -121,7 +120,9 @@ def build_tools(warehouse: Warehouse) -> dict[str, Tool]:
                 "List every queryable table/view, its columns and types, how many rows it has, "
                 "which monday.com board it came from, and how the board's real column names map "
                 "onto the semantic names (amount, sector, stage, close_date...). "
-                "ALWAYS call this before writing your first SQL query in a conversation."
+                "The system prompt already contains this for the loaded boards, so call this "
+                "ONLY if you need a detail it does not show — a column you cannot find, or a "
+                "collision rename."
             ),
             parameters={"type": "object", "properties": {}, "required": []},
             run=get_schema,
@@ -130,8 +131,10 @@ def build_tools(warehouse: Warehouse) -> dict[str, Tool]:
             name="list_distinct_values",
             description=(
                 "List the actual distinct values in a categorical column, with row counts. "
-                "Use this before filtering on any category (sector, stage, status, client, region) "
-                "so you filter on the real spelling instead of guessing. Cheap — call it freely."
+                "The system prompt already lists values for every low-cardinality category, so "
+                "use this only for a column it does not cover — typically a high-cardinality one "
+                "like client or record code — or to confirm a value before a filter you are "
+                "unsure of."
             ),
             parameters={
                 "type": "object",
@@ -260,16 +263,20 @@ def _leadership_brief(warehouse: Warehouse, *, period: str, sector: str) -> dict
         "caveats": [],
     }
 
-    def section(key: str, sql: str) -> None:
+    def section(key: str, *, scope: str, sql: str) -> None:
+        """``scope`` is carried into the payload so the model cannot present an
+        as-of-today risk list under a historical period heading."""
         try:
             frame = warehouse.run_sql(sql)
-            brief["sections"][key] = _frame_to_payload(frame, max_rows=25)
+            payload = _frame_to_payload(frame, max_rows=25)
         except WarehouseError as exc:
-            brief["sections"][key] = {"error": str(exc)}
+            payload = {"error": str(exc)}
+        payload["scope"] = scope
+        brief["sections"][key] = payload
 
     if "deals" in tables:
         scope = f"WHERE ({where_period}){sector_clause}"
-        section("pipeline_by_stage", f"""
+        section("pipeline_by_stage", scope=f"{period}", sql=f"""
             SELECT COALESCE(stage, status, 'Unspecified') AS stage,
                    COUNT(*)                 AS deals,
                    SUM(amount)              AS total_value,
@@ -278,21 +285,21 @@ def _leadership_brief(warehouse: Warehouse, *, period: str, sector: str) -> dict
             FROM deals {scope}
             GROUP BY 1 ORDER BY total_value DESC NULLS LAST
         """)
-        section("by_sector", f"""
+        section("by_sector", scope=f"{period}", sql=f"""
             SELECT COALESCE(sector, 'Unspecified') AS sector,
                    COUNT(*)    AS deals,
                    SUM(amount) AS total_value
             FROM deals {scope}
             GROUP BY 1 ORDER BY total_value DESC NULLS LAST LIMIT 12
         """)
-        section("top_accounts", f"""
+        section("top_accounts", scope=f"{period}", sql=f"""
             SELECT COALESCE(client, item_name, 'Unnamed') AS account,
                    COUNT(*)    AS deals,
                    SUM(amount) AS total_value
             FROM deals {scope}
             GROUP BY 1 ORDER BY total_value DESC NULLS LAST LIMIT 10
         """)
-        section("slipping_deals", f"""
+        section("slipping_deals", scope="as of today, NOT limited to the period", sql=f"""
             SELECT COALESCE(client, item_name) AS account,
                    stage, amount, close_date
             FROM deals
@@ -303,7 +310,7 @@ def _leadership_brief(warehouse: Warehouse, *, period: str, sector: str) -> dict
               {sector_clause}
             ORDER BY close_date LIMIT 15
         """)
-        section("period_totals", f"""
+        section("period_totals", scope=f"{period}", sql=f"""
             SELECT COUNT(*) AS deals,
                    SUM(amount) AS total_pipeline_value,
                    SUM(amount) FILTER (WHERE lower(COALESCE(stage, status, '')) LIKE '%won%')  AS won_value,
@@ -314,14 +321,14 @@ def _leadership_brief(warehouse: Warehouse, *, period: str, sector: str) -> dict
 
     if "work_orders" in tables:
         scope = f"WHERE ({where_period}){sector_clause}"
-        section("delivery_by_status", f"""
+        section("delivery_by_status", scope=f"{period}", sql=f"""
             SELECT COALESCE(status, stage, 'Unspecified') AS status,
                    COUNT(*) AS work_orders,
                    SUM(amount) AS total_value
             FROM work_orders {scope}
             GROUP BY 1 ORDER BY work_orders DESC
         """)
-        section("overdue_work_orders", f"""
+        section("overdue_work_orders", scope="as of today, NOT limited to the period", sql=f"""
             SELECT COALESCE(client, item_name) AS project,
                    status, end_date, owner
             FROM work_orders
@@ -333,7 +340,7 @@ def _leadership_brief(warehouse: Warehouse, *, period: str, sector: str) -> dict
               {sector_clause}
             ORDER BY end_date LIMIT 15
         """)
-        section("delivery_by_sector", f"""
+        section("delivery_by_sector", scope=f"{period}", sql=f"""
             SELECT COALESCE(sector, 'Unspecified') AS sector,
                    COUNT(*) AS work_orders,
                    SUM(amount) AS total_value
@@ -352,8 +359,11 @@ def _leadership_brief(warehouse: Warehouse, *, period: str, sector: str) -> dict
 
     brief["formatting_instruction"] = (
         "Turn this into a short executive update: 3-5 headline bullets with the actual "
-        "numbers, then what changed and why it matters, then risks (slipping deals, "
-        "overdue work orders), then a 'data caveats' line if any caveats are listed. "
-        "Do not print the raw JSON."
+        "numbers, then what changed and why it matters, then risks, then a 'data caveats' "
+        "line if any caveats are listed. Do not print the raw JSON.\n"
+        "IMPORTANT: every section carries a 'scope' field. Sections scoped 'as of today' "
+        "(slipping_deals, overdue_work_orders) are CURRENT-STATE risk lists and are NOT "
+        "filtered to the requested period — never present them under a past-period "
+        "heading. Say 'currently slipping' / 'overdue as of today' instead."
     )
     return brief

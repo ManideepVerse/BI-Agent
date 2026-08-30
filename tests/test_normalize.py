@@ -116,7 +116,7 @@ def test_parse_date_never_raises():
 # ------------------------------------------------------------- label merging
 def test_canonicalise_merges_case_and_whitespace():
     series = pd.Series(["Energy", "energy ", " ENERGY", "Mining", None, "N/A"])
-    clean, mapping, _near = canonicalise_series(series)
+    clean, mapping, _near, _alias = canonicalise_series(series)
     assert set(clean.dropna()) == {"Energy", "Mining"}
     assert mapping["energy"] == "Energy"
     assert clean.isna().sum() == 2
@@ -125,14 +125,14 @@ def test_canonicalise_merges_case_and_whitespace():
 def test_canonicalise_applies_status_aliases():
     from src.normalize import STATUS_ALIASES
 
-    series = pd.Series(["Closed Won", "won", "WON", "Closed-Lost"])
-    clean, _m, _n = canonicalise_series(series, STATUS_ALIASES)
+    series = pd.Series(["Closed Won", "closed won", "CLOSED WON", "Closed-Lost"])
+    clean, _m, _n, _a = canonicalise_series(series, STATUS_ALIASES)
     assert list(clean) == ["Closed Won", "Closed Won", "Closed Won", "Closed Lost"]
 
 
 def test_canonicalise_does_not_merge_genuinely_different_labels():
     series = pd.Series(["Energy", "Energy & Utilities", "Mining"])
-    clean, _m, near = canonicalise_series(series)
+    clean, _m, near, _a = canonicalise_series(series)
     assert set(clean) == {"Energy", "Energy & Utilities", "Mining"}
     assert any("Energy" in group and "Energy & Utilities" in group for group in near)
 
@@ -190,15 +190,15 @@ def test_units_do_not_break_quantities():
 
 def test_acronyms_are_not_title_cased():
     """A label with only one spelling is left exactly as the business wrote it."""
-    clean, _m, _n = canonicalise_series(pd.Series(["DSP", "DSP", "Mining"]))
+    clean, _m, _n, _a = canonicalise_series(pd.Series(["DSP", "DSP", "Mining"]))
     assert set(clean) == {"DSP", "Mining"}
 
-    clean, _m, _n = canonicalise_series(pd.Series(["I. POC", "E. Proposal/Commercials Sent"]))
+    clean, _m, _n, _a = canonicalise_series(pd.Series(["I. POC", "E. Proposal/Commercials Sent"]))
     assert "I. POC" in set(clean)
 
 
 def test_case_variants_still_collapse_to_the_tidiest_spelling():
-    clean, _m, _n = canonicalise_series(pd.Series(["mining", "mining", "Mining"]))
+    clean, _m, _n, _a = canonicalise_series(pd.Series(["mining", "mining", "Mining"]))
     assert set(clean) == {"Mining"}
 
 
@@ -271,3 +271,95 @@ def test_normalize_board_handles_empty_board():
     table = normalize_board("deals", schema, [])
     assert table.df.empty
     assert "zero items" in " ".join(table.quality.warnings)
+
+
+# ------------------------------------- currency is retained per row (#3)
+def test_mixed_currency_column_keeps_the_currency_per_row():
+    """Collecting currencies into a set for the warning, then discarding them,
+    made it structurally impossible to avoid adding ₹ to $."""
+    from src.monday_client import BoardColumn, BoardSchema
+
+    columns = [BoardColumn(id="c0", title="Deal Value", type="numbers")]
+    values = ["₹1,20,000", "$2,000", "₹80,000", "$500"]
+    records = [
+        {"__item_id__": str(i), "__item_name__": f"D{i}", "__group__": "g",
+         "__created_at__": None, "__updated_at__": None, "__json__": {}, "Deal Value": v}
+        for i, v in enumerate(values)
+    ]
+    table = normalize_board("deals", BoardSchema(id="b", name="Deals", columns=columns), records)
+
+    assert "deal_value__currency" in table.df.columns
+    assert list(table.df["deal_value__currency"]) == ["INR", "USD", "INR", "USD"]
+    assert any("mixes currencies" in w for w in table.quality.warnings)
+
+
+def test_single_currency_column_labels_every_row():
+    """Only some cells carry a symbol; the column's one currency applies to all."""
+    from src.monday_client import BoardColumn, BoardSchema
+
+    columns = [BoardColumn(id="c0", title="Deal Value", type="numbers")]
+    records = [
+        {"__item_id__": str(i), "__item_name__": f"D{i}", "__group__": "g",
+         "__created_at__": None, "__updated_at__": None, "__json__": {}, "Deal Value": v}
+        for i, v in enumerate(["₹1,20,000", "80000", "45000"])
+    ]
+    table = normalize_board("deals", BoardSchema(id="b", name="Deals", columns=columns), records)
+    assert set(table.df["deal_value__currency"].dropna()) == {"INR"}
+
+
+# --------------------------------------- alias merges are reported (#4)
+def test_alias_merges_are_never_silent():
+    from src.normalize import STATUS_ALIASES
+
+    # "Won Closed" and "Closed Won" are different keys, so only the alias table
+    # merges them — and that merge must show up in the report.
+    series = pd.Series(["Won Closed", "Closed Won", "In Progress"])
+    clean, _m, _near, alias_merges = canonicalise_series(series, STATUS_ALIASES)
+    assert set(clean) == {"Closed Won", "In Progress"}
+    assert alias_merges == {"Won Closed": "Closed Won"}, alias_merges
+
+
+def test_near_duplicates_are_detected_before_aliases_collapse_them():
+    """The alias table used to run first, so 'Energy & Utilities' -> 'Energy'
+    erased the very double-counting the report exists to surface."""
+    from src.normalize import SECTOR_ALIASES
+
+    series = pd.Series(["Energy", "Energy & Utilities", "Mining"])
+    _clean, _m, near, _a = canonicalise_series(series, SECTOR_ALIASES)
+    assert any("Energy" in g and "Energy & Utilities" in g for g in near)
+
+
+def test_aliases_never_change_what_a_label_means():
+    """'Dropped' is not 'Closed Lost'; 'Planned' is not 'Not Started'. Those are
+    opinions about someone else's funnel, and they moved the numbers."""
+    from src.normalize import STATUS_ALIASES
+
+    series = pd.Series(["Dropped", "Closed Lost", "Planned", "Not Started", "Active", "In Progress"])
+    clean, _m, _n, _a = canonicalise_series(series, STATUS_ALIASES)
+    assert set(clean) == {"Dropped", "Closed Lost", "Planned", "Not Started", "Active", "In Progress"}
+
+
+def test_renewable_energy_is_not_folded_into_renewables():
+    """This silently corrupted the assignment's flagship 'energy sector' query."""
+    from src.normalize import SECTOR_ALIASES
+
+    series = pd.Series(["Renewable Energy", "Renewables", "Energy"])
+    clean, _m, _n, _a = canonicalise_series(series, SECTOR_ALIASES)
+    assert set(clean) == {"Renewable Energy", "Renewables", "Energy"}
+
+
+# ----------------------------------------- per-column date direction (#11)
+def test_dayfirst_is_inferred_per_column():
+    from src.normalize import infer_dayfirst
+
+    assert infer_dayfirst(["25/12/2025", "03/04/2025"])[0] is True
+    assert infer_dayfirst(["12/25/2025", "03/04/2025"])[0] is False
+    dayfirst, ambiguous, evidence = infer_dayfirst(["03/04/2025", "05/06/2025"])
+    assert ambiguous == 2 and evidence == "no evidence"
+
+
+def test_conflicting_date_directions_are_reported_not_hidden():
+    from src.normalize import infer_dayfirst
+
+    _dayfirst, _ambiguous, evidence = infer_dayfirst(["25/12/2025", "12/25/2025"])
+    assert evidence == "conflicting evidence"

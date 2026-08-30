@@ -9,6 +9,12 @@ text column, which throws away type information the board should carry. This
 infers a sensible monday column type per source column (date / numbers / status
 / text) and creates the board accordingly.
 
+Note on typed columns: monday stores a date column as a date, so a value that
+cannot be parsed is imported as empty and the original text is NOT recoverable
+from the board afterwards. ``<col>__raw`` in the warehouse therefore holds what
+monday returned, not the original spreadsheet cell. Use --as-text to import
+every column as text instead, which preserves the mess exactly as written.
+
 Usage
 -----
     export MONDAY_API_TOKEN=...
@@ -21,8 +27,8 @@ Add --dry-run first to see the inferred schema without touching monday.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -34,7 +40,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.config import get_setting  # noqa: E402  (also loads .env on import)
 from src.logging_conf import get_logger, setup_logging  # noqa: E402
 from src.monday_client import MondayClient  # noqa: E402
-from src.normalize import infer_kind, is_null_token, parse_date, parse_number  # noqa: E402
+from src.normalize import (  # noqa: E402
+    infer_dayfirst,
+    infer_kind,
+    is_null_token,
+    parse_date,
+    parse_number,
+)
 
 log = get_logger("import")
 
@@ -86,12 +98,29 @@ def _unique_headers(values) -> list[str]:
     return names
 
 
+def _read_ragged_csv(path: Path) -> pd.DataFrame:
+    """Read a CSV whose rows do not all have the same number of fields.
+
+    The assignment's own layout — a banner row above the real header — produces
+    exactly this, and pandas raises ParserError on it. Widening every row to the
+    widest one keeps the banner *and* the data instead of crashing.
+    """
+    kwargs = dict(dtype=object, header=None, keep_default_na=False, na_values=[""])
+    try:
+        return pd.read_csv(path, **kwargs)
+    except pd.errors.ParserError:
+        with open(path, newline="", encoding="utf-8", errors="replace") as handle:
+            width = max((len(row) for row in csv.reader(handle)), default=1)
+        print(f"  (ragged CSV: rows have differing field counts; padded to {width} columns)")
+        return pd.read_csv(path, names=range(width), engine="python", **kwargs)
+
+
 def read_table(path: Path) -> pd.DataFrame:
     """Read a CSV/XLSX, finding the real header row and stripping junk rows."""
     if path.suffix.lower() in (".xlsx", ".xlsm", ".xls"):
         raw = pd.read_excel(path, dtype=object, header=None)
     else:
-        raw = pd.read_csv(path, dtype=object, header=None, keep_default_na=False, na_values=[""])
+        raw = _read_ragged_csv(path)
 
     if raw.empty:
         return raw
@@ -140,11 +169,11 @@ def infer_monday_type(series: pd.Series) -> str:
     return "text"
 
 
-def to_column_value(value, monday_type: str):
+def to_column_value(value, monday_type: str, *, dayfirst: bool = True):
     if is_null_token(value):
         return None
     if monday_type == "date":
-        parsed = parse_date(value)
+        parsed = parse_date(value, dayfirst=dayfirst)
         return {"date": parsed.isoformat()} if parsed else None
     if monday_type == "numbers":
         number, _currency = parse_number(value)
@@ -176,6 +205,8 @@ def main() -> int:
     parser.add_argument("--name-column", default="", help="Column to use as the item name (default: first column)")
     parser.add_argument("--dry-run", action="store_true", help="Print the inferred schema and exit")
     parser.add_argument("--limit", type=int, default=0, help="Import only the first N rows (for testing)")
+    parser.add_argument("--as-text", action="store_true",
+                        help="Import every column as text, preserving unparseable values verbatim")
     args = parser.parse_args()
 
     if not args.file.exists():
@@ -195,7 +226,21 @@ def main() -> int:
         return 1
 
     value_columns = [c for c in frame.columns if c != name_column]
-    types = {c: infer_monday_type(frame[c]) for c in value_columns}
+    types = ({c: 'text' for c in value_columns} if args.as_text
+             else {c: infer_monday_type(frame[c]) for c in value_columns})
+
+    # Date format is inferred per column, exactly as the cleaner does it. A
+    # global dayfirst would silently corrupt an MM/DD column at import, and the
+    # original text is gone by then — monday only stores what we send.
+    dayfirst_by_column = {
+        column: infer_dayfirst(frame[column])[0]
+        for column, monday_type in types.items() if monday_type == "date"
+    }
+    for column, dayfirst in dayfirst_by_column.items():
+        _amb = infer_dayfirst(frame[column])[1]
+        if _amb:
+            print(f"  ({column!r}: {_amb} ambiguous dates read as "
+                  f"{'DD/MM' if dayfirst else 'MM/DD'})")
 
     print(f"\n{args.file.name}: {len(frame)} rows, {len(frame.columns)} columns")
     print(f"Item name column: {name_column!r}\n")
@@ -252,7 +297,10 @@ def main() -> int:
             item_name = str(item_name).strip() if not is_null_token(item_name) else f"Row {start + offset + 1}"
             values = {}
             for column, monday_type in types.items():
-                payload = to_column_value(row.get(column), monday_type)
+                payload = to_column_value(
+                    row.get(column), monday_type,
+                    dayfirst=dayfirst_by_column.get(column, True),
+                )
                 if payload is not None:
                     values[column_ids[column]] = payload
 
@@ -275,6 +323,25 @@ def main() -> int:
         time.sleep(BATCH_PAUSE_SECONDS)
 
     print(f"\n\nDone. {created_count}/{len(frame)} items created.")
+
+    # A partial import is the worst outcome here: nothing errors afterwards, the
+    # agent just under-reports every total for ever. Say so loudly, and confirm
+    # against what monday itself thinks the board holds.
+    if created_count < len(frame):
+        missing = len(frame) - created_count
+        print(f"\n  !! {missing} row(s) did NOT import ({missing / len(frame):.0%} of the file).",
+              file=sys.stderr)
+        print("     Delete this board and re-run — every answer will be understated otherwise.",
+              file=sys.stderr)
+    try:
+        on_board = client._post(
+            "query ($ids: [ID!]) { boards(ids: $ids) { items_count } }", {"ids": [board_id]}
+        )["boards"][0]["items_count"]
+        marker = "ok" if on_board == created_count else "!!"
+        print(f"  [{marker}] monday reports {on_board} items on the board "
+              f"(expected {created_count}).")
+    except Exception as exc:  # pragma: no cover - verification must not fail the import
+        print(f"  (could not verify the board's item count: {exc})")
     print(f"\nAdd this to your .env / Streamlit secrets:\n  BOARD_ID for {args.board_name!r} = {board_id}")
     client.close()
     return 0

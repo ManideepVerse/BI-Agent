@@ -506,6 +506,32 @@ class OpenAILLM(BaseLLM):
 # --------------------------------------------------------------------------- #
 # Anthropic
 # --------------------------------------------------------------------------- #
+def _as_blocks(content: Any) -> list[dict]:
+    """Anthropic content is either a string or a list of blocks; normalise it."""
+    if isinstance(content, list):
+        return list(content)
+    return [{"type": "text", "text": str(content)}]
+
+
+def _append_block(message: dict, block: dict) -> None:
+    message["content"] = _as_blocks(message.get("content", [])) + [block]
+
+
+def _merge_adjacent_user_turns(messages: list[dict]) -> list[dict]:
+    """Collapse consecutive same-role messages into one.
+
+    Anthropic rejects two user messages in a row. Both the parallel-tool-call
+    path and the step-limit nudge in the agent loop can produce them.
+    """
+    merged: list[dict] = []
+    for message in messages:
+        if merged and merged[-1]["role"] == message["role"]:
+            merged[-1]["content"] = _as_blocks(merged[-1]["content"]) + _as_blocks(message["content"])
+        else:
+            merged.append({"role": message["role"], "content": message["content"]})
+    return merged
+
+
 class AnthropicLLM(BaseLLM):
     provider = "anthropic"
     BASE = "https://api.anthropic.com/v1"
@@ -541,14 +567,21 @@ class AnthropicLLM(BaseLLM):
                 if blocks:
                     payload_messages.append({"role": "assistant", "content": blocks})
             elif role == "tool":
-                payload_messages.append({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": message["tool_call_id"],
-                        "content": message["content"],
-                    }],
-                })
+                block = {
+                    "type": "tool_result",
+                    "tool_use_id": message["tool_call_id"],
+                    "content": message["content"],
+                }
+                # Anthropic requires strictly alternating roles, and every
+                # tool_result answering one assistant turn must sit in a SINGLE
+                # user message. Two parallel tool calls previously produced two
+                # consecutive user messages and a 400.
+                if payload_messages and payload_messages[-1]["role"] == "user":
+                    _append_block(payload_messages[-1], block)
+                else:
+                    payload_messages.append({"role": "user", "content": [block]})
+
+        payload_messages = _merge_adjacent_user_turns(payload_messages)
 
         payload: dict[str, Any] = {
             "model": self.model,

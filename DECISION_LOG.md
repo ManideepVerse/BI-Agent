@@ -37,7 +37,8 @@ rather than imply a hard link.
 **Cleaning rules.** Never drop a row — unparseable values become `NULL` with the original kept
 in `<column>__raw`. Merge only what is unambiguous: `"Energy"`/`"energy "`/`" ENERGY"` collapse
 automatically, but `"Energy"` vs `"Energy & Utilities"` are reported as possible
-double-counting rather than silently merged. Infer date format per column from the data (a day
+double-counting rather than silently merged — and near-duplicate detection runs *before* the
+alias table so an alias can never hide one. Every merge an alias does perform is reported too. Infer date format per column from the data (a day
 component > 12 proves DD/MM). Parse numbers strictly — `₹12,50,000`, `1.2 Cr`, `(2500)` and
 `5360 HA` all parse, but `"note 5 about the client"` deliberately does not, because a plausible
 wrong number is worse than a null.
@@ -51,8 +52,12 @@ there are five money columns per work order, and a naive "column named *value*" 
 percentage. Role patterns are explicitly ordered as a result, header-echo rows are detected and
 excluded, and `scripts/dry_run_pipeline.py` reproduces this profiling with no credentials.
 
-**Safety.** No mutating GraphQL exists in the app; `run_sql` rejects DDL, DML and
-statement-stacking; identifiers are pattern-validated; credentials are redacted from logs.
+**Safety.** No mutating GraphQL exists in the app. DuckDB itself runs with
+`enable_external_access=false` and a locked configuration, because a keyword blocklist cannot
+stop `read_text('…/secrets.toml')` — that is a table function, not a keyword. On top of that,
+`run_sql` rejects DDL, DML and statement-stacking, checked against a copy with string literals
+and comments blanked out so a stage named `'Update Pending'` is not mistaken for an UPDATE.
+Identifiers are pattern-validated; credentials are redacted from logs.
 
 ## 3. How I interpreted "help prepare data for leadership updates"
 
@@ -70,11 +75,13 @@ that posts to Slack on a founder's behalf needs an approval step that did not fi
 
 ## 4. What I'd do differently with more time
 
-**Fix period scoping.** Found in manual testing: when a period filter matches nothing, the
-agent sometimes reports unfiltered totals under the period heading instead of saying the
-period is empty — and it can present a calendar quarter and the identical fiscal quarter as
-though they were different windows. The fix is a prompt constraint plus an eval case; I chose
-not to change the prompt untested at the deadline.
+**Fix period scoping in the prompt.** When a period filter matches nothing, the agent still
+sometimes reports unfiltered totals under the period heading instead of saying the period is
+empty, and can present a calendar quarter and the identical fiscal quarter as if they were
+different windows. The underlying *data* bug behind this is fixed — `fiscal_quarter` used
+float division, so every quarter came out fractional (3.67) and a `fiscal_quarter = 1` filter
+matched only April, under-reporting FY answers by ~75% with no error raised. The remaining
+half is a prompt constraint plus an eval case.
 
 **Incremental sync** on `updated_at` instead of full board reloads — the one thing limiting
 scale. **Verify numbers with a second pass** that re-derives each headline figure with an

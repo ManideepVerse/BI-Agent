@@ -456,3 +456,72 @@ def test_gemini_ranking_returns_every_usable_model_best_first():
     assert ranked[0] == "gemini-3.6-flash"
     assert "gemini-embedding-001" not in ranked
     assert len(ranked) == 3
+
+
+# ------------------------------------------- Anthropic message shaping (#6)
+class _ScriptedAnthropic(llm_module.AnthropicLLM):
+    def __init__(self):
+        self._key = "k"
+        self.model = "claude-x"
+        self.sent: dict = {}
+
+        class _Transport:
+            def request(_s, method, url, **kwargs):
+                self.sent = kwargs.get("json") or {}
+                return _FakeResponse(200, '{"content": [{"type":"text","text":"ok"}]}')
+
+        self._client = _Transport()
+
+    def _discover_model(self):
+        return "claude-x"
+
+
+def _roles(messages):
+    return [m["role"] for m in messages]
+
+
+def test_parallel_tool_results_collapse_into_one_user_message():
+    """Two tool calls in one turn must not become two consecutive user turns."""
+    client = _ScriptedAnthropic()
+    history = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            ToolCall(id="c1", name="run_sql", args={}),
+            ToolCall(id="c2", name="get_schema", args={}),
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "name": "run_sql", "content": "{}"},
+        {"role": "tool", "tool_call_id": "c2", "name": "get_schema", "content": "{}"},
+    ]
+    client.chat("sys", history, [])
+    messages = client.sent["messages"]
+
+    assert _roles(messages) == ["user", "assistant", "user"], _roles(messages)
+    results = [b for b in messages[-1]["content"] if b["type"] == "tool_result"]
+    assert len(results) == 2
+    assert {b["tool_use_id"] for b in results} == {"c1", "c2"}
+
+
+def test_step_limit_nudge_does_not_create_two_user_turns():
+    """The agent's 'stop and answer now' nudge lands right after tool results."""
+    client = _ScriptedAnthropic()
+    history = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "", "tool_calls": [ToolCall(id="c1", name="run_sql", args={})]},
+        {"role": "tool", "tool_call_id": "c1", "name": "run_sql", "content": "{}"},
+        {"role": "user", "content": "[system] answer now"},
+    ]
+    client.chat("sys", history, [])
+    roles = _roles(client.sent["messages"])
+    assert roles == ["user", "assistant", "user"], roles
+    assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1)), "roles must alternate"
+
+
+def test_single_tool_result_still_works():
+    client = _ScriptedAnthropic()
+    history = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "thinking", "tool_calls": [ToolCall(id="c1", name="run_sql", args={})]},
+        {"role": "tool", "tool_call_id": "c1", "name": "run_sql", "content": "{}"},
+    ]
+    client.chat("sys", history, [])
+    assert _roles(client.sent["messages"]) == ["user", "assistant", "user"]

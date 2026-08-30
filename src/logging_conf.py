@@ -29,11 +29,28 @@ class _RedactFilter(logging.Filter):
         return True
 
 
+def _configured_level() -> str:
+    """LOG_LEVEL from the environment *or* Streamlit secrets.
+
+    Reading os.environ alone silently ignored the setting on Streamlit Cloud,
+    where configuration arrives through st.secrets.
+    """
+    try:
+        from .config import get_setting
+
+        return str(get_setting("LOG_LEVEL", "INFO"))
+    except Exception:  # pragma: no cover - config must never break logging
+        return os.environ.get("LOG_LEVEL", "INFO")
+
+
 def setup_logging(level: str | None = None) -> None:
+    """Configure logging. An explicit ``level`` re-applies even if already set,
+    so a caller that knows the configured level is not silently ignored by an
+    earlier import-time default."""
     global _CONFIGURED
-    if _CONFIGURED:
+    if _CONFIGURED and level is None:
         return
-    level = (level or os.environ.get("LOG_LEVEL") or "INFO").upper()
+    level = (level or _configured_level() or "INFO").upper()
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)-7s %(name)s | %(message)s", "%H:%M:%S")
