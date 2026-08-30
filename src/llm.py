@@ -133,18 +133,16 @@ def _model_version(name: str) -> tuple[float, ...]:
     return (major + minor,)
 
 
-def _pick_gemini_model(available: list[str], exclude: set[str] | None = None) -> Optional[str]:
-    """Choose the best Gemini chat model, newest first.
+def _rank_gemini_models(available: list[str], exclude: set[str] | None = None) -> list[str]:
+    """Rank Gemini chat models best-first.
 
     Deliberately version-agnostic: Google retires model ids faster than anyone
     redeploys, and a hardcoded preference list is guaranteed to go stale. This
     ranks by capability class then by version number, so a newly released
-    ``gemini-4-flash`` is picked automatically.
+    ``gemini-4-flash`` sorts to the top automatically.
     """
     exclude = exclude or set()
     usable = [m for m in available if not _EXCLUDE_MODEL.search(m) and m not in exclude]
-    if not usable:
-        return None
 
     def score(name: str) -> tuple:
         lowered = name.lower()
@@ -160,7 +158,29 @@ def _pick_gemini_model(available: list[str], exclude: set[str] | None = None) ->
             -len(name),
         )
 
-    return max(usable, key=score)
+    return sorted(usable, key=score, reverse=True)
+
+
+def _pick_gemini_model(available: list[str], exclude: set[str] | None = None) -> Optional[str]:
+    ranked = _rank_gemini_models(available, exclude)
+    return ranked[0] if ranked else None
+
+
+def _rank_by_preference(available: list[str], preferences: list[str]) -> list[str]:
+    """Rank models so preferred families sort first, stable builds before dated ones."""
+    def score(name: str) -> tuple:
+        lowered = name.lower()
+        rank = next(
+            (len(preferences) - i for i, pref in enumerate(preferences) if pref in lowered),
+            0,
+        )
+        return (
+            rank,
+            0 if re.search(r"preview|\d{4}-\d{2}-\d{2}|\d{8}", lowered) else 1,
+            -len(name),
+        )
+
+    return sorted(available, key=score, reverse=True)
 
 
 def _pick_model(available: list[str], preferences: list[str]) -> Optional[str]:
@@ -199,8 +219,16 @@ class BaseLLM:
             pass
 
     # -- to implement ------------------------------------------------------
-    def _discover_model(self) -> str:  # pragma: no cover - overridden
+    def list_models(self) -> list[str]:  # pragma: no cover - overridden
+        """Chat-capable models this key can use, best first."""
         raise NotImplementedError
+
+    def _discover_model(self) -> str:
+        models = self.list_models()
+        if not models:
+            raise LLMError(f"No usable {self.provider} chat model is available for this key.")
+        log.info("%s model selected: %s", self.provider, models[0])
+        return models[0]
 
     def chat(self, system: str, messages: list[dict], tools: list) -> LLMReply:  # pragma: no cover
         raise NotImplementedError
@@ -293,18 +321,14 @@ class GeminiLLM(BaseLLM):
     def _headers(self) -> dict:
         return {"x-goog-api-key": self._key, "Content-Type": "application/json"}
 
-    def _discover_model(self) -> str:
+    def list_models(self) -> list[str]:
         body = self._request("GET", f"{self.BASE}/models", headers=self._headers())
         names = [
             m["name"].split("/")[-1]
             for m in body.get("models", [])
             if "generateContent" in (m.get("supportedGenerationMethods") or [])
         ]
-        chosen = _pick_gemini_model(names, exclude=self._retired)
-        if not chosen:
-            raise LLMError("No Gemini model supporting generateContent is available for this key.")
-        log.info("Gemini model selected: %s", chosen)
-        return chosen
+        return _rank_gemini_models(names, exclude=self._retired)
 
     def chat(self, system: str, messages: list[dict], tools: list) -> LLMReply:
         try:
@@ -425,14 +449,14 @@ class OpenAILLM(BaseLLM):
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
 
-    def _discover_model(self) -> str:
+    def list_models(self) -> list[str]:
         body = self._request("GET", f"{self.BASE}/models", headers=self._headers())
-        names = [m["id"] for m in body.get("data", []) if m.get("id", "").startswith("gpt")]
-        chosen = _pick_model(names, self.default_preferences)
-        if not chosen:
-            raise LLMError("No suitable OpenAI chat model is available for this key.")
-        log.info("OpenAI model selected: %s", chosen)
-        return chosen
+        names = [
+            m["id"] for m in body.get("data", [])
+            if m.get("id", "").startswith(("gpt", "o1", "o3", "o4"))
+            and not _EXCLUDE_MODEL.search(m.get("id", ""))
+        ]
+        return _rank_by_preference(names, self.default_preferences)
 
     def chat(self, system: str, messages: list[dict], tools: list) -> LLMReply:
         payload_messages: list[dict] = [{"role": "system", "content": system}]
@@ -497,14 +521,10 @@ class AnthropicLLM(BaseLLM):
             "Content-Type": "application/json",
         }
 
-    def _discover_model(self) -> str:
+    def list_models(self) -> list[str]:
         body = self._request("GET", f"{self.BASE}/models?limit=100", headers=self._headers())
-        names = [m["id"] for m in body.get("data", [])]
-        chosen = _pick_model(names, self.default_preferences)
-        if not chosen:
-            raise LLMError("No Claude model is available for this key.")
-        log.info("Anthropic model selected: %s", chosen)
-        return chosen
+        names = [m["id"] for m in body.get("data", []) if not _EXCLUDE_MODEL.search(m.get("id", ""))]
+        return _rank_by_preference(names, self.default_preferences)
 
     def chat(self, system: str, messages: list[dict], tools: list) -> LLMReply:
         payload_messages: list[dict] = []
@@ -565,6 +585,43 @@ def build_llm(provider: str, api_key: str, model: str = "") -> BaseLLM:
     if cls is None:
         raise LLMError(f"Unsupported LLM provider '{provider}'. Choose one of {sorted(_PROVIDERS)}.")
     return cls(api_key, model)
+
+
+PROVIDER_LABELS = {
+    "gemini": "Google Gemini",
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+}
+
+# Each vendor issues keys with a distinctive prefix, so the provider can be
+# inferred rather than asked for — one less thing for a reviewer to get wrong.
+_KEY_SHAPES = (
+    ("sk-ant-", "anthropic"),
+    ("AIza", "gemini"),
+    ("sk-", "openai"),
+)
+
+
+def detect_provider(api_key: str) -> Optional[str]:
+    """Infer the provider from an API key's prefix, or None if unrecognised."""
+    key = (api_key or "").strip()
+    for prefix, provider in _KEY_SHAPES:
+        if key.startswith(prefix):
+            return provider
+    return None
+
+
+def available_models(provider: str, api_key: str) -> list[str]:
+    """List the chat models a key can actually use, best first.
+
+    Used to populate the model picker. Constructed with a placeholder model so
+    the client does not perform its own discovery round trip first.
+    """
+    client = build_llm(provider, api_key, model="__probe__")
+    try:
+        return client.list_models()
+    finally:
+        client.close()
 
 
 # --------------------------------------------------------------------------- #

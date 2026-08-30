@@ -33,17 +33,20 @@ TODAY IS {today}.
 You have a small analytical warehouse loaded from two monday.com boards. You answer \
 questions by querying it, never from memory or assumption.
 
-1. Call `get_schema` once at the start of a conversation to learn the tables, the real \
-   column names and the semantic aliases.
-2. Before filtering on ANY category value (sector, stage, status, client, region), call \
-   `list_distinct_values` for that column. Real data spells things inconsistently — \
-   "energy" may actually be stored as "Energy", "Energy & Utilities" or both. Never guess \
-   a filter value.
-3. Use `run_sql` to compute every number you report. One focused query at a time. Prefer \
-   aggregates over dumping rows.
-4. Use `get_data_quality` when a result looks odd, when the user asks how reliable \
+**The schema and the category vocabularies are given to you below.** They are already loaded \
+— do NOT spend a tool call re-fetching them. Go straight to `run_sql`.
+
+1. Use `run_sql` to compute every number you report. Prefer one well-shaped query over \
+   several narrow ones: a single `GROUP BY` with a few aggregate columns usually answers more \
+   than three separate queries.
+2. Only call `get_schema` or `list_distinct_values` if you need something the context below \
+   does not show — a high-cardinality column's values, or a column you cannot find.
+3. Use `get_data_quality` when a result looks odd, when the user asks how reliable \
    something is, and before any answer that leans on a column you suspect is sparse.
-5. Use `prepare_leadership_brief` when asked for an exec/leadership/board update.
+4. Use `prepare_leadership_brief` when asked for an exec/leadership/board update.
+
+Filter categories using the exact spellings listed below. Never invent a filter value, and \
+never report zero for a category whose name simply differs from the user's wording.
 
 ## Interpreting founder-level questions
 
@@ -158,14 +161,76 @@ class BIAgent:
         self._warehouse = warehouse
         self._tools = tools
         self._max_steps = max_steps
+        self._context_cache: str = ""
+        self._context_stamp = None
 
     # ------------------------------------------------------------------ API
     def system_prompt(self) -> str:
         today = date.today()
-        return SYSTEM_PROMPT.format(
+        base = SYSTEM_PROMPT.format(
             today=today.strftime("%A, %d %B %Y"),
             cal_quarter=f"{today.year}-Q{(today.month - 1) // 3 + 1}",
         )
+        return base + self._data_context()
+
+    def _data_context(self) -> str:
+        """Inline the schema and category vocabularies into the system prompt.
+
+        Profiling the live agent showed four of every six round trips were spent
+        re-fetching static context — the schema, then the distinct values of
+        sector, stage and status — before any real work began. That context is a
+        couple of hundred tokens and never changes between questions, so it
+        belongs in the prompt. Cached per warehouse load and rebuilt on refresh.
+        """
+        try:
+            loaded_at = self._warehouse.loaded_at()
+        except Exception:  # pragma: no cover - defensive
+            return ""
+        if self._context_cache and self._context_stamp == loaded_at:
+            return self._context_cache
+
+        try:
+            payload = self._warehouse.schema_payload()
+        except Exception:  # pragma: no cover - the agent still works without this
+            log.warning("Could not build inline data context; falling back to tool calls.")
+            return ""
+
+        lines = ["\n\n# DATA CONTEXT (already loaded — do not re-fetch)\n"]
+        for table in payload.get("tables", []):
+            view = table["view"]
+            lines.append(f"\n## `{view}` — {table['row_count']} rows, from board '{table['source_board']}'")
+
+            mapping = table.get("semantic_mapping") or {}
+            if mapping:
+                pairs = ", ".join(f"{role}={col}" for role, col in sorted(mapping.items()))
+                lines.append(f"Semantic aliases: {pairs}")
+
+            columns = []
+            for column in table.get("columns", []):
+                note = f" [{column['missing_pct']:.0f}% empty]" if column["missing_pct"] >= 25 else ""
+                columns.append(f"{column['name']}:{column['type']}{note}")
+            lines.append("Columns: " + ", ".join(columns))
+
+            for column in table.get("columns", []):
+                if column["type"] != "category" or not 1 <= column["distinct"] <= 30:
+                    continue
+                try:
+                    frame = self._warehouse.distinct_values(view, column["name"], limit=30)
+                except Exception:
+                    continue
+                values = " | ".join(str(v) for v in frame["value"].tolist())
+                if values:
+                    lines.append(f"  · {column['name']} values: {values}")
+
+        lines.append(
+            "\nDerived on every view: primary_date, cal_year, cal_quarter, cal_period "
+            "('2026-Q3'), cal_month, fiscal_year, fiscal_quarter (Indian April-March). "
+            "Columns ending __raw hold the original uncleaned text."
+        )
+        context = "\n".join(lines)
+        self._context_cache = context
+        self._context_stamp = loaded_at
+        return context
 
     def run(self, history: list[dict]) -> Iterator[AgentEvent]:
         """Drive the reason/act loop. ``history`` is the canonical message list.

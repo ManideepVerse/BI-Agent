@@ -416,3 +416,43 @@ def test_model_picker_excludes_non_chat_models():
         ["gemini-flash"],
     )
     assert chosen == "gemini-2.0-flash"
+
+
+# ------------------------------------------------------ provider detection
+@pytest.mark.parametrize("key,expected", [
+    ("AIzaSyABC123def", "gemini"),
+    ("sk-proj-abc123", "openai"),
+    ("sk-abc123", "openai"),
+    ("sk-ant-api03-xyz", "anthropic"),
+    ("  AIzaSyPadded  ", "gemini"),
+    ("hello", None),
+    ("", None),
+    (None, None),
+])
+def test_provider_is_inferred_from_the_key_prefix(key, expected):
+    """A reviewer pastes a key; they should not also have to say whose it is."""
+    assert llm_module.detect_provider(key) == expected
+
+
+def test_anthropic_prefix_wins_over_the_openai_prefix():
+    """sk-ant- also starts with sk-, so ordering matters."""
+    assert llm_module.detect_provider("sk-ant-api03-xyz") == "anthropic"
+
+
+# -------------------------------------------------------- model ranking
+def test_openai_ranking_prefers_small_fast_models_and_undated_ids():
+    ranked = llm_module._rank_by_preference(
+        ["gpt-4o", "gpt-4.1-mini", "gpt-4o-mini", "gpt-4o-2024-08-06"],
+        ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4o"],
+    )
+    assert ranked[0] == "gpt-4.1-mini"
+    assert ranked.index("gpt-4o") < ranked.index("gpt-4o-2024-08-06")
+
+
+def test_gemini_ranking_returns_every_usable_model_best_first():
+    ranked = llm_module._rank_gemini_models(
+        ["gemini-2.0-flash", "gemini-3.6-pro", "gemini-3.6-flash", "gemini-embedding-001"]
+    )
+    assert ranked[0] == "gemini-3.6-flash"
+    assert "gemini-embedding-001" not in ranked
+    assert len(ranked) == 3
